@@ -16,7 +16,6 @@ perf.data*
 
 # Documentation files
 CLAUDE.md
-README.md
 
 # results/ is deliberately NOT ignored -- committed CSVs and PNGs are what a
 # reader sees without building anything. See README.
