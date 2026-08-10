@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.cxx }} / ${{ matrix.preset }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pkg: g++-13,   cc: gcc-13,   cxx: g++-13,     preset: release }
+          - { pkg: g++-13,   cc: gcc-13,   cxx: g++-13,     preset: asan }
+          - { pkg: clang-18, cc: clang-18, cxx: clang++-18, preset: release }
+          - { pkg: clang-18, cc: clang-18, cxx: clang++-18, preset: asan }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ${{ matrix.pkg }}
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake --preset ${{ matrix.preset }} -DFABRIC_WERROR=ON
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+      # Proves the headline path actually runs, not just that the tests link.
+      - name: Smoke scenario
+        run: ./build/${{ matrix.preset }}/fabricsim --scenario=smoke | tee smoke-${{ matrix.cxx }}-${{ matrix.preset }}.txt
+
+      - name: Upload run output
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.cxx }}-${{ matrix.preset }}
+          path: smoke-${{ matrix.cxx }}-${{ matrix.preset }}.txt
+
+  # The simulator is single-threaded by construction (see docs/design.md), so
+  # there is deliberately no TSan job. Determinism is checked instead: the same
+  # configuration must produce the same result digest, which is asserted inside
+  # the test suite above.
+  reproducibility:
+    name: same config, same answer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-13
+
+      - name: Build
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: |
+          cmake --preset release -DFABRIC_WERROR=ON
+          cmake --build --preset release
+
+      - name: Run twice and diff the modelled output
+        run: |
+          # Wall-clock timing lines differ by design; everything the model
+          # produces must not.
+          ./build/release/fabricsim --scenario=smoke | grep -v '^events' > run1.txt
+          ./build/release/fabricsim --scenario=smoke | grep -v '^events' > run2.txt
+          diff -u run1.txt run2.txt
+          echo "identical across runs"
