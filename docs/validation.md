@@ -45,6 +45,61 @@ asserted in `tests/integration/test_analytical_fct.cpp`.
 packets), propagation delays (0, 100, 5000 ns), link rates (10, 25, 100,
 400 Gb/s) and both the 4-hop cross-leaf and 2-hop same-leaf paths.
 
+## Multi-flow: the lower-bound test
+
+The closed form generalises to a source paced below line rate. With release
+period `T` (equal to `ser` at full rate):
+
+```
+FCT = (n − 1) · T + h · ser + h · d
+```
+
+Implemented as `paced_fct_ns()`. Under *any* routing policy and *any* amount of
+cross traffic this is a **lower bound** on a flow's completion time — congestion
+can only add queueing delay, never remove it.
+
+`tests/integration/test_permutation.cpp` asserts that no flow in a 16-flow
+permutation ever beats its own bound. This is the cheapest strong check on the
+whole model: a packet that skipped a hop, a link that forgot to charge
+serialisation, or a routing table that took a short cut would all show up here.
+
+A second test closes the other side. At 25% offered load nothing queues anywhere,
+so the fastest flow must **equal** its bound exactly — not merely exceed it —
+which catches a model that charges a delay it should not.
+
+## Percentiles: nearest rank
+
+The definition is part of the claim, so it is pinned by
+`tests/unit/test_metrics.cpp` rather than left to whichever convention a plotting
+library defaults to.
+
+**p_q is the observation at rank `ceil(q · n)` of the ascending sample.** No
+interpolation between neighbours, so every reported percentile is the completion
+time of a flow that actually existed. p99 of 10 samples is the largest of them,
+and that is intentional.
+
+Flows that never completed are **excluded from the percentiles and counted
+separately**. This is the most dangerous number in the project: percentiles over
+the survivors flatter every one of them, because the flows that failed are
+exactly the ones that were doing worst. `FctSummary::complete()` is false
+whenever any flow is missing, and both the CLI and the tests are required to say
+so rather than print a number that looks fine.
+
+## The ECMP hash is tested, not assumed
+
+A weak hash collides flows onto the same path more often than chance. That would
+make ECMP look terrible, make the adaptive router look brilliant, and turn the
+headline number into a measurement of the strawman. `tests/unit/test_ecmp_hash.cpp`
+therefore asserts:
+
+| check | why |
+|---|---|
+| Chi-square uniformity at p=0.999 over 4032 structured flows, for 2/4/8/16 candidates | sequential addresses and ports are where a weak mixer fails |
+| The same, for 32 different switch salts | a hash uniform at one switch and lumpy at another gives the fabric permanently unlucky nodes |
+| Two switches agree on a path ≈1 time in 8, not always | hash polarization across tiers |
+| The choice is stable for a given flow | per-flow, not per-packet: this is why ECMP never reorders |
+| Every 5-tuple field changes the hash | hashing addresses only is a real failure mode |
+
 ## Guarding against rounding artefacts
 
 `serialization_ns()` truncates. A configuration where `M·8·10⁹` is not divisible
@@ -79,9 +134,14 @@ Three properties, all asserted in `tests/integration/test_determinism.cpp`:
    different digest, so (1) and (2) are not vacuous.
 
 Verified additionally across build configurations: Release, Debug and
-RelWithDebInfo+ASan/UBSan all produce `fct = 120 760 ns` for the smoke scenario.
-That is the integer-only core doing its job — with floating point in the model,
+RelWithDebInfo+ASan/UBSan all produce `fct = 120 760 ns` for the smoke scenario
+and result digest `0x155eb497f134d2a8` for the 128-flow ECMP permutation. That is
+the integer-only core doing its job — with floating point in the model,
 optimisation level alone could move the last digits.
+
+The permutation digest is the stronger of the two: it covers 128 flows, a hashed
+routing decision at every hop, and roughly 700 000 events, any one of which
+reordering would change the answer.
 
 ## Topology and routing invariants
 
@@ -97,3 +157,19 @@ From `tests/unit/`:
 - **Loop freedom** — every candidate at every node is a strict step toward the
   destination, so no routing policy, however it chooses among candidates, can be
   made to loop.
+
+For the fat-tree (`tests/unit/test_fat_tree.cpp`), at k = 2, 4, 6, 8:
+
+- **Shape** — k³/4 hosts and 5k²/4 switches; every switch has exactly k ports and
+  every host exactly one. Building a fat-tree out of uniform k-port switches is
+  its defining property, and a wiring bug shows up here before it shows up as a
+  routing anomaly.
+- **Path count** — cross-pod host pairs have exactly k²/4 equal-cost paths,
+  same-pod pairs k/2, same-edge-switch pairs 1. Enumerated by walking the
+  candidate sets, not asserted from the formula.
+- **Tier breadth** — an edge switch leaving its pod sees k/2 uplinks; an
+  aggregation switch sees k/2 cores; a core switch sees exactly one aggregation
+  switch per pod. If any of these collapsed to a single candidate, ECMP and the
+  adaptive router would be the same function.
+- **Hop count** — following any candidate reaches the destination in exactly
+  `fat_tree_hops()` hops, for all 240 ordered host pairs at k=4.

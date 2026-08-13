@@ -53,8 +53,11 @@ endif()
 add_library(fabric_core STATIC
   src/fabric/model/fabric.cpp
   src/fabric/topology/leaf_spine.cpp
+  src/fabric/topology/fat_tree.cpp
   src/fabric/routing/route_table.cpp
   src/fabric/core/simulation.cpp
+  src/fabric/workload/permutation.cpp
+  src/fabric/metrics/fct.cpp
   src/fabric/harness/scenario.cpp
 )
 target_include_directories(fabric_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -82,9 +85,13 @@ if(FABRIC_BUILD_TESTS)
     tests/unit/test_event_queue.cpp
     tests/unit/test_units.cpp
     tests/unit/test_topology.cpp
+    tests/unit/test_fat_tree.cpp
     tests/unit/test_routing.cpp
+    tests/unit/test_ecmp_hash.cpp
+    tests/unit/test_metrics.cpp
     tests/integration/test_analytical_fct.cpp
     tests/integration/test_determinism.cpp
+    tests/integration/test_permutation.cpp
   )
   target_link_libraries(fabric_tests PRIVATE fabric_core doctest)
 

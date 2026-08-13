@@ -5,17 +5,6 @@
 
 namespace fabric {
 
-namespace {
-
-[[nodiscard]] constexpr std::uint64_t splitmix64(std::uint64_t x) noexcept {
-  x += 0x9E37'79B9'7F4A'7C15ULL;
-  x = (x ^ (x >> 30)) * 0xBF58'476D'1CE4'E5B9ULL;
-  x = (x ^ (x >> 27)) * 0x94D0'49BB'1331'11EBULL;
-  return x ^ (x >> 31);
-}
-
-}  // namespace
-
 Simulation::Simulation(Fabric fabric, RouteTable routes)
     : fabric_(std::move(fabric)), routes_(std::move(routes)) {}
 
@@ -24,9 +13,19 @@ FlowId Simulation::add_flow(const FlowSpec& spec) {
   assert(spec.size_bytes > 0);
   assert(fabric_.node(spec.src).is_host && fabric_.node(spec.dst).is_host);
   assert(spec.src != spec.dst);
+  assert(spec.load_permille > 0 && spec.load_permille <= 1000);
 
   const auto id = static_cast<std::uint32_t>(specs_.size());
   specs_.push_back(spec);
+
+  // Host dense indices stand in for IP addresses. splitmix64 mixes small
+  // sequential integers as well as it mixes anything else -- that is what it was
+  // designed for -- so nothing is gained by dressing them up as dotted quads.
+  FlowRoute fr;
+  fr.dst_host = fabric_.host_index(spec.dst);
+  fr.key = FlowKey{fabric_.host_index(spec.src), fr.dst_host, spec.src_port, spec.dst_port,
+                   spec.protocol};
+  froutes_.push_back(fr);
 
   FlowResult r;
   r.start_ns = spec.start_ns;
@@ -37,7 +36,7 @@ FlowId Simulation::add_flow(const FlowSpec& spec) {
   return FlowId{id};
 }
 
-RunStats Simulation::run() {
+void Simulation::begin_run() {
   queue_.clear();
   fabric_.reset_state();
   now_ = 0;
@@ -55,6 +54,22 @@ RunStats Simulation::run() {
     r.complete = false;
     queue_.push(Event::inject(specs_[i].start_ns, FlowId{static_cast<std::uint32_t>(i)}, 0));
   }
+}
+
+void Simulation::end_run() {
+  stats_.virtual_end_ns = now_;
+  for (const FlowResult& r : results_) {
+    if (r.complete) {
+      ++stats_.flows_complete;
+    } else {
+      ++stats_.flows_incomplete;
+    }
+  }
+}
+
+template <RoutingPolicy Policy>
+RunStats Simulation::run(const Policy& policy) {
+  begin_run();
 
   // --- hot loop -----------------------------------------------------------
   while (!queue_.empty()) {
@@ -71,22 +86,17 @@ RunStats Simulation::run() {
         on_tx_complete(e);
         break;
       case EventType::Arrive:
-        on_arrive(e);
+        on_arrive(e, policy);
         break;
     }
   }
   // ------------------------------------------------------------------------
 
-  stats_.virtual_end_ns = now_;
-  for (const FlowResult& r : results_) {
-    if (r.complete) {
-      ++stats_.flows_complete;
-    } else {
-      ++stats_.flows_incomplete;
-    }
-  }
+  end_run();
   return stats_;
 }
+
+RunStats Simulation::run() { return run(StaticFirstPolicy{}); }
 
 void Simulation::on_inject(const Event& e) {
   const FlowId f = e.flow();
@@ -105,11 +115,13 @@ void Simulation::on_inject(const Event& e) {
   stats_.bytes_injected += bytes;
   enqueue(nic, Packet{f, idx, bytes});
 
-  // Source pacing lives entirely in this schedule: the next packet is released
-  // one serialisation time later, which is exactly NIC line rate. The host
-  // queue therefore never backs up in M0. M2 replaces this with ack clocking.
+  // Source pacing lives entirely in this schedule. At load_permille == 1000 the
+  // period is exactly one serialisation time, i.e. NIC line rate, and the host
+  // queue never backs up. Below that the source simply idles between packets.
+  // M2 replaces the whole scheme with ack clocking.
   if (offset + bytes < spec.size_bytes) {
-    const Nanos period = serialization_ns(bytes, fabric_.port(nic).rate);
+    const Nanos ser = serialization_ns(bytes, fabric_.port(nic).rate);
+    const Nanos period = (ser * 1000ULL) / spec.load_permille;
     queue_.push(Event::inject(now_ + period, f, idx + 1));
   }
 }
@@ -131,12 +143,16 @@ void Simulation::on_tx_complete(const Event& e) {
   }
 }
 
-void Simulation::on_arrive(const Event& e) {
+template <RoutingPolicy Policy>
+void Simulation::on_arrive(const Event& e, const Policy& policy) {
   const NodeId at = fabric_.port(e.port()).peer_node;
   const FlowId f = e.flow();
-  const FlowSpec& spec = specs_[f.index()];
 
-  if (at == spec.dst) {
+  // Routing only ever forwards toward the destination and a host is never a
+  // transit node, so arriving at a host means arriving home. Cheaper than
+  // reloading the FlowSpec to compare node ids; the assert keeps it honest.
+  if (fabric_.node(at).is_host) {
+    assert(at == specs_[f.index()].dst);
     FlowResult& r = results_[f.index()];
     ++r.packets_delivered;
     r.delivered_bytes += e.bytes;
@@ -148,15 +164,18 @@ void Simulation::on_arrive(const Event& e) {
     return;
   }
 
-  assert(!fabric_.node(at).is_host && "a host is never a transit node");
-  enqueue(select_output(at, spec), Packet{f, e.packet_index(), e.bytes});
+  const FlowRoute& fr = froutes_[f.index()];
+  const std::span<const PortId> cand = routes_.candidates(at, fr.dst_host);
+  assert(!cand.empty() && "no route to destination");
+
+  enqueue(policy.select(at, fr.key, cand, now_), Packet{f, e.packet_index(), e.bytes});
 }
 
 void Simulation::enqueue(PortId pid, const Packet& pkt) {
   Port& p = fabric_.port(pid);
 
   if (!p.queue.try_push(pkt)) {
-    // Drop-tail. No retransmission in M0, so the owning flow will simply never
+    // Drop-tail. No retransmission yet, so the owning flow will simply never
     // complete and run() reports it as incomplete.
     ++p.packets_dropped;
     p.bytes_dropped += pkt.bytes;
@@ -177,29 +196,24 @@ void Simulation::start_tx(PortId pid) {
   queue_.push(Event::tx_complete(now_ + serialization_ns(p.in_flight.bytes, p.rate), pid));
 }
 
-PortId Simulation::select_output(NodeId at, const FlowSpec& spec) const noexcept {
-  const std::uint32_t dst_host = fabric_.host_index(spec.dst);
-  const std::span<const PortId> cand = routes_.candidates(at, dst_host);
-  assert(!cand.empty() && "no route to destination");
-
-  // M0 policy: always the first shortest-path candidate. Deliberately trivial
-  // and deterministic; M1's ECMP hashes the flow key across this same span and
-  // M3's adaptive policy picks by queue occupancy.
-  return cand[0];
-}
-
 std::uint64_t Simulation::result_digest() const noexcept {
   std::uint64_t h = 0xCBF2'9CE4'8422'2325ULL;
   for (const FlowResult& r : results_) {
     const std::uint64_t packed = (static_cast<std::uint64_t>(r.packets_delivered) << 32) |
                                  static_cast<std::uint64_t>(r.packets_dropped);
-    h = splitmix64(h ^ r.start_ns);
-    h = splitmix64(h ^ r.finish_ns);
-    h = splitmix64(h ^ r.delivered_bytes);
-    h = splitmix64(h ^ packed);
-    h = splitmix64(h ^ static_cast<std::uint64_t>(r.complete));
+    h = mix64(h ^ r.start_ns);
+    h = mix64(h ^ r.finish_ns);
+    h = mix64(h ^ r.delivered_bytes);
+    h = mix64(h ^ packed);
+    h = mix64(h ^ static_cast<std::uint64_t>(r.complete));
   }
   return h;
 }
+
+// Every policy the binary ships, instantiated at the end of the translation
+// unit where all the templates it calls are defined. This is what keeps the hot
+// loop out of every header that mentions a Simulation; M3 adds one more line.
+template RunStats Simulation::run<StaticFirstPolicy>(const StaticFirstPolicy&);
+template RunStats Simulation::run<EcmpPolicy>(const EcmpPolicy&);
 
 }  // namespace fabric
