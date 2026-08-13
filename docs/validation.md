@@ -67,6 +67,56 @@ A second test closes the other side. At 25% offered load nothing queues anywhere
 so the fastest flow must **equal** its bound exactly — not merely exceed it —
 which catches a model that charges a delay it should not.
 
+## Ring all-reduce: the collective closed form
+
+The collective is 2(N−1) dependent steps, each one chunk of `S/N` bytes crossing
+`h` links, so the total is the per-step time multiplied out:
+
+```
+T = 2(N − 1) · [ (chunk_packets − 1)·T_period + h·ser + h·d ]
+```
+
+This is the integer-exact form of the textbook `T = 2(N−1)α + 2(N−1)/N · S/B`,
+with `α = h(ser + d)` the per-step latency. The textbook version drops the
+store-and-forward pipeline fill and treats the chunk as a real number; this one
+does neither, which is why it can be asserted as an equality rather than a
+tolerance.
+
+**The exact-identity configuration, and why it is honest.** Equality is asserted
+on a ring confined to a single edge switch. There, every ring hop is `host →
+edge → host` and the flows are **link-disjoint**: each host's uplink carries only
+its own data and each downlink only its predecessor's, so nothing can queue
+anywhere. The configuration also gives acks zero wire time.
+
+That last condition is deliberate and is stated rather than hidden. In a ring,
+rank r sends data to r+1 and acks to r−1 through the *same* NIC, so with
+realistic acks the uplink demand is `ser + ack_ser` per period and a data packet
+can be delayed behind an ack being clocked. The identity would then be false for
+a reason that has nothing to do with the collective. `ack_is_free()` reports
+whether a given (ack_bytes, rate) pair serialises to zero nanoseconds, and
+`AllReduceScenario::analytical_exact` requires it — so the identity tests the
+step count, the chunk arithmetic and the barrier, and nothing else.
+
+A companion test runs the same ring with 64-byte acks, confirms the harness stops
+claiming an identity, and asserts the measured time is `>=` the closed form. The
+128-GPU cross-pod ring is checked the same way, as a bound.
+
+**Barrier semantics** are asserted directly: every dependent flow's start time
+equals its predecessor's finish time exactly. A collective whose steps overlapped
+by even a nanosecond would not be a collective.
+
+## Transport
+
+| check | why |
+|---|---|
+| Single-flow FCT unchanged by the arrival of real acks | a directed link is a port, so with one sender and one receiver the ack stream has the reverse direction to itself |
+| Ack bytes conserved: injected = delivered + dropped | acks are packets, subject to the same accounting as data |
+| A one-packet window costs exactly `(n−1)·RTT + h(ser + d)` | the price of an undersized window, asserted rather than assumed |
+| `window_is_sufficient()` guards every exact comparison | a throttled window must never be able to masquerade as a modelling result |
+| Tiny buffers → drops → retransmissions → every unique byte still delivered | loss recovery works, and duplicates are not double-counted |
+| `max_attempts` exhausted → the flow is reported failed and the run terminates | a pathological run must end loudly, not hang |
+| Deterministic under loss | retransmission introduces no nondeterminism |
+
 ## Percentiles: nearest rank
 
 The definition is part of the claim, so it is pinned by
@@ -135,13 +185,14 @@ Three properties, all asserted in `tests/integration/test_determinism.cpp`:
 
 Verified additionally across build configurations: Release, Debug and
 RelWithDebInfo+ASan/UBSan all produce `fct = 120 760 ns` for the smoke scenario
-and result digest `0x155eb497f134d2a8` for the 128-flow ECMP permutation. That is
-the integer-only core doing its job — with floating point in the model,
-optimisation level alone could move the last digits.
+and collective time `645 875 ns` with digest `0xcdfe20a26882e047` for the k=4
+all-reduce. That is the integer-only core doing its job — with floating point in
+the model, optimisation level alone could move the last digits.
 
-The permutation digest is the stronger of the two: it covers 128 flows, a hashed
-routing decision at every hop, and roughly 700 000 events, any one of which
-reordering would change the answer.
+The collective digest is much the stronger of the two: 480 flows, a dependency
+chain 30 steps deep, a hashed routing decision at every hop for both data and
+acks, and every retransmission timer. Reordering any one event changes the
+answer.
 
 ## Topology and routing invariants
 

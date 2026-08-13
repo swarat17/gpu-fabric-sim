@@ -48,6 +48,11 @@ struct FctSummary {
 // and bootstrap resampling consume.
 [[nodiscard]] std::vector<Nanos> completed_fcts(std::span<const FlowResult> results);
 
+// When a collective finished: the last flow to complete, measured from time
+// zero. Returns 0 if any flow never completed, because a collective missing one
+// chunk has not finished -- there is no partial credit for a barrier.
+[[nodiscard]] Nanos collective_time_ns(std::span<const FlowResult> results) noexcept;
+
 [[nodiscard]] FctSummary summarize_fct(std::span<const FlowResult> results);
 
 }  // namespace fabric

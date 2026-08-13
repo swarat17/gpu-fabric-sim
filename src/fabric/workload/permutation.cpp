@@ -37,6 +37,7 @@ std::vector<FlowSpec> make_permutation(const Fabric& f, const PermutationParams&
     s.size_bytes = params.flow_bytes;
     s.mtu_bytes = params.mtu_bytes;
     s.load_permille = params.load_permille;
+    s.window_pkts = params.window_pkts;
     // Ephemeral source port, well-known destination port: the realistic shape,
     // and the source port is where a real sender's hash entropy comes from.
     s.src_port = static_cast<std::uint16_t>(1024u + port_rng.below(63488u));

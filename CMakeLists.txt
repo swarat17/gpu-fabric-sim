@@ -57,6 +57,7 @@ add_library(fabric_core STATIC
   src/fabric/routing/route_table.cpp
   src/fabric/core/simulation.cpp
   src/fabric/workload/permutation.cpp
+  src/fabric/workload/all_reduce.cpp
   src/fabric/metrics/fct.cpp
   src/fabric/harness/scenario.cpp
 )
@@ -92,6 +93,8 @@ if(FABRIC_BUILD_TESTS)
     tests/integration/test_analytical_fct.cpp
     tests/integration/test_determinism.cpp
     tests/integration/test_permutation.cpp
+    tests/integration/test_all_reduce.cpp
+    tests/integration/test_transport.cpp
   )
   target_link_libraries(fabric_tests PRIVATE fabric_core doctest)
 

@@ -8,12 +8,26 @@
 
 namespace fabric {
 
+// Data and acknowledgement share the queues and the wire, because they do in a
+// real fabric: an ack is a small packet that competes for the same buffers and
+// gets dropped by the same drop-tail rule. Modelling acks as free would make the
+// transport's feedback loop faster than any real one.
+enum class PacketKind : std::uint8_t {
+  Data = 0,
+  Ack = 1,
+};
+
 // What actually sits in an output queue. The payload is never materialised --
 // only its length matters to the model -- so a packet is 12 bytes of metadata.
 struct Packet {
   FlowId flow{};
   std::uint32_t index = 0;  // packet index within the flow
   std::uint16_t bytes = 0;
+  PacketKind kind = PacketKind::Data;
+  // Which transmission attempt this is. Carried so that a retransmission
+  // timer belonging to a superseded attempt can be recognised and ignored;
+  // see Simulation::on_timeout.
+  std::uint8_t attempt = 0;
 };
 
 static_assert(sizeof(Packet) <= 12);

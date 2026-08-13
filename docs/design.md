@@ -83,9 +83,10 @@ so a rounding artefact can never be mistaken for a modelling result.
 Simulation::run()
   └─ pop min Event                          [core/event_queue.hpp: binary heap]
      └─ switch on Event::type               [no virtual calls]
-        ├─ Inject      → enqueue at NIC, schedule next release
+        ├─ Inject      → send whatever the window and pacing allow
         ├─ TxComplete  → hand to the wire, start next queued packet
-        └─ Arrive      → deliver, or route and enqueue at an output port
+        ├─ Arrive      → route onward; or deliver and ack; or open the window
+        └─ Timeout     → retransmit, unless acked or superseded
 ```
 
 Everything else — config parsing, topology construction, routing-table
@@ -206,19 +207,70 @@ agree about 1 time in 8 rather than always. A weak hash would collide flows more
 often than chance, ECMP would look terrible for free, and the headline number
 would be measuring the strawman rather than the routing idea.
 
-## Source pacing is open loop, for now
+## The transport: fixed window, ack clocked
 
-`FlowSpec::load_permille` sets the inter-packet release period as a fraction of
-NIC line rate; 1000 is line rate. The source paces to that rate regardless of
-what the network is doing.
+A sender keeps at most `window_pkts` packets outstanding and releases the next
+one when an ack comes back. Below that, `FlowSpec::load_permille` paces sends as
+a fraction of NIC line rate — a closed-loop sender alone has no notion of offered
+load, and M4's sweep needs one.
 
-This is honest for M1 and it has a visible consequence: a permutation at full
-line rate under ECMP loses about 45% of its bytes, because two flows hashing onto
-one uplink means a sustained 2:1 overload that a 128-packet buffer cannot absorb
-and nothing tells the sender to slow down. That is not a bug — it is what an
-uncontrolled source does — and it is the motivation for the ack-clocked transport
-in M2. Until then, load is swept below the collision threshold and every run
-reports incomplete flows explicitly.
+Why this was needed before the adaptive router: in M1 the source was open loop,
+so a permutation at full line rate lost about 45% of its bytes. Two flows hashing
+onto one uplink is a sustained 2:1 overload, a 128-packet buffer cannot absorb
+it, and nothing told the sender to slow down. Comparing routers under those
+conditions would have measured which router drops less, through a mechanism no
+real fabric would allow. With the window in place the same run delivers every
+byte and the congestion shows up as queueing delay — which is the quantity the
+adaptive router is supposed to reduce.
+
+Three decisions inside it are worth defending:
+
+- **Acks are real packets.** They are routed on the *reversed* 5-tuple, so the
+  reverse path is hashed independently and need not mirror the forward path, as
+  in a real fabric. They queue, they consume reverse-path capacity, and they can
+  be dropped. Modelling them as free would make the feedback loop faster than any
+  real one and would quietly correlate ack delivery with data delivery.
+- **Loss is detected by a timer, and the timer is generous.**
+  `default_rto_ns()` covers a full round trip plus a completely full buffer at
+  every hop. A timeout that fires while a packet is merely queued produces a
+  spurious retransmission — and does so *in proportion to how congested a path
+  is*, which would systematically penalise whichever router leaves packets queued
+  longest. That is exactly the quantity under study, so slow recovery from a real
+  drop is the cheaper error.
+- **Timers are invalidated lazily.** There is no cheap way to remove an entry
+  from the middle of a binary heap, so a timer carries the attempt number it
+  belongs to and a superseded one is recognised and dropped when it fires.
+
+Deliberately absent: any reactive congestion control. No DCQCN, no TIMELY, no
+window adaptation. That is a project in itself and it would entangle the routing
+result with congestion-control tuning; it ships as a stated limitation.
+
+Note that completion and failure are not opposites. Completion is a property of
+the receiver — it has every byte. Failure is a property of the sender — it
+exhausted `max_attempts` on some packet. A sender whose acks are being dropped
+can give up on a packet the receiver already holds, so a flow can be both.
+
+## Flow dependencies, and why a collective is not a batch of flows
+
+`FlowSpec::depends_on` names a flow that must complete before this one starts;
+`Simulation` keeps a CSR table of dependents and releases them on completion,
+starting the dependent's completion-time clock at that moment rather than at its
+nominal start time.
+
+That one mechanism is all the simulator core knows about collectives. Ring
+all-reduce is then just 2(N−1) steps of N flows with the chain wired up in
+`workload/all_reduce.cpp`: rank r cannot send its step-s chunk until it has
+received the step s−1 chunk from rank r−1.
+
+The barrier is the point. A collective finishes when the slowest link in the
+dependency chain finishes, not when the average one does, so a routing decision
+that leaves one flow queued behind another does not cost the average — it costs
+the entire collective. This is why the project reports p99 rather than mean FCT,
+and why "a few flows got unlucky" is not a small problem.
+
+A failed flow therefore strands everything downstream of it, which is visible and
+intended: with deliberately tiny buffers, a k=4 collective reports 10 senders that
+gave up and 73 flows that never completed.
 
 ## Threading: there is none
 
@@ -235,14 +287,14 @@ not an oversight.
 
 ## What is deliberately not here yet
 
-- **Reactive congestion control** (DCQCN, TIMELY). Out of scope for the project;
-  the transport model in M2 is a fixed ack-clocked window and ships as a stated
-  limitation.
-- **Retransmission and any sender feedback.** There is none through M1, so a
-  dropped packet leaves its flow permanently incomplete — and `RunStats` reports
-  incomplete flows rather than quietly dropping them from the statistics, because
-  the flows that fail are exactly the ones that were doing worst. Both arrive
-  with the transport model in M2.
+- **Reactive congestion control** (DCQCN, TIMELY). Out of scope; the transport is
+  a fixed ack-clocked window and ships as a stated limitation.
+- **Ack coalescing.** Every data packet is acked individually. Real NICs coalesce;
+  doing so here would reduce reverse-path load and slightly weaken the feedback
+  loop, and neither effect is what the project is measuring.
+- **Lossless fabric mechanisms** (PFC, credit flow control). The fabric is
+  drop-tail, and losses are recovered by timeout. Deep buffers rather than link-
+  level backpressure are how the headline configuration avoids loss.
 - **A custom allocator.** The handle-based design with pre-sized vectors may
   make one unnecessary. That is a question for M5 profiling to answer, and if
   the answer is "not needed", that is the result that gets reported.

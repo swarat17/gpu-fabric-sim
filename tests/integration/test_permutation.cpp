@@ -21,6 +21,18 @@ PermutationConfig config(std::uint32_t k, RoutingAlgorithm routing, std::uint64_
   cfg.workload.seed = seed;
   cfg.workload.flow_bytes = 300'000;  // 200 packets: enough to congest, quick to run
   cfg.workload.load_permille = load_permille;
+  cfg.workload.window_pkts = 32;
+  return cfg;
+}
+
+// Every host both sends and receives here, so acks share the sender's uplink
+// with its data and a flow can be delayed by an ack being clocked ahead of it.
+// Where a test asserts an exact identity rather than a bound, it gives acks zero
+// wire time so that the identity is about the network model and nothing else.
+PermutationConfig config_free_acks(std::uint32_t k, RoutingAlgorithm routing, std::uint64_t seed,
+                                   std::uint32_t load_permille) {
+  PermutationConfig cfg = config(k, routing, seed, load_permille);
+  cfg.transport.ack_bytes = 1;  // serialises to zero nanoseconds at these rates
   return cfg;
 }
 
@@ -52,7 +64,9 @@ TEST_CASE("bytes are conserved: injected equals delivered plus dropped") {
     const RunStats stats = run_with_routing(sc.sim, sc.routing, sc.seed);
     CAPTURE(routing_name(algo));
     CHECK(stats.bytes_injected == stats.bytes_delivered + stats.bytes_dropped);
-    CHECK(stats.bytes_injected == static_cast<Bytes>(sc.flow_count) * 300'000);
+    CHECK(stats.ack_bytes_injected == stats.ack_bytes_delivered + stats.ack_bytes_dropped);
+    // At least the offered bytes; more if anything had to be retransmitted.
+    CHECK(stats.bytes_injected >= static_cast<Bytes>(sc.flow_count) * 300'000);
   }
 }
 
@@ -89,7 +103,7 @@ TEST_CASE("the shortest path in the workload achieves the lower bound at low loa
   // At a low enough offered load nothing queues anywhere, so the best flow must
   // match the closed form exactly -- not approximately. If it does not, the
   // model is charging a delay it should not.
-  const PermutationConfig cfg = config(4, RoutingAlgorithm::Ecmp, 5, 250);
+  const PermutationConfig cfg = config_free_acks(4, RoutingAlgorithm::Ecmp, 5, 250);
   PermutationScenario sc = build_permutation(cfg);
   REQUIRE(sc.analytical_exact);
 

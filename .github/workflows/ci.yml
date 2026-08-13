@@ -42,11 +42,14 @@ jobs:
       - name: Smoke scenario
         run: ./build/${{ matrix.preset }}/fabricsim --scenario=smoke | tee smoke-${{ matrix.cxx }}-${{ matrix.preset }}.txt
 
-      # 25% offered load is below the point where ECMP collisions start dropping
-      # packets, so this run is expected to deliver every byte. When the transport
-      # model lands in M2 the load here goes up.
+      # Full line rate: the ack-clocked window is what keeps this from collapsing
+      # the way the open-loop sender in M1 did.
       - name: Permutation scenario
-        run: ./build/${{ matrix.preset }}/fabricsim --scenario=permutation --k=8 --routing=ecmp --load=250 | tee -a smoke-${{ matrix.cxx }}-${{ matrix.preset }}.txt
+        run: ./build/${{ matrix.preset }}/fabricsim --scenario=permutation --k=8 --routing=ecmp --queue=2048 | tee -a smoke-${{ matrix.cxx }}-${{ matrix.preset }}.txt
+
+      # k=4 keeps the collective quick enough for the sanitizer legs.
+      - name: All-reduce scenario
+        run: ./build/${{ matrix.preset }}/fabricsim --scenario=allreduce --k=4 --queue=2048 | tee -a smoke-${{ matrix.cxx }}-${{ matrix.preset }}.txt
 
       - name: Upload run output
         uses: actions/upload-artifact@v4
@@ -84,8 +87,9 @@ jobs:
           for run in 1 2; do
             {
               ./build/release/fabricsim --scenario=smoke
-              ./build/release/fabricsim --scenario=permutation --k=8 --load=250
-              ./build/release/fabricsim --scenario=permutation --k=8 --load=1000 || true
+              ./build/release/fabricsim --scenario=permutation --k=8 --queue=2048
+              ./build/release/fabricsim --scenario=allreduce --k=4 --queue=2048
+              ./build/release/fabricsim --scenario=allreduce --k=4 --queue=8 || true
             } | grep -v '^events' > "run$run.txt"
           done
           diff -u run1.txt run2.txt

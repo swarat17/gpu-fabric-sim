@@ -26,6 +26,7 @@ struct PermutationParams {
   Bytes flow_bytes = 1'000'000;
   std::uint16_t mtu_bytes = 1500;
   std::uint32_t load_permille = 1000;  // offered load per source, 1000 = line rate
+  std::uint32_t window_pkts = 32;      // sender window; see min_window_packets()
   Nanos max_start_jitter_ns = 0;       // 0 = every flow starts at t = 0
 };
 

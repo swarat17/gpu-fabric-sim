@@ -31,6 +31,19 @@ std::vector<Nanos> completed_fcts(std::span<const FlowResult> results) {
   return v;
 }
 
+Nanos collective_time_ns(std::span<const FlowResult> results) noexcept {
+  Nanos last = 0;
+  for (const FlowResult& r : results) {
+    if (!r.complete) {
+      return 0;
+    }
+    if (r.finish_ns > last) {
+      last = r.finish_ns;
+    }
+  }
+  return last;
+}
+
 FctSummary summarize_fct(std::span<const FlowResult> results) {
   FctSummary s;
   s.flows_total = static_cast<std::uint32_t>(results.size());
